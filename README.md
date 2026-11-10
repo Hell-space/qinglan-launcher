@@ -1,2 +1,7 @@
-# qinglan-launcher
-青岚 Minecraft Java 启动器 · Windows 正式版与更新说明
+# 青岚启动器
+
+青岚是 Windows x64 上的 Minecraft Java 启动器。[下载最新正式版及查看更新说明](https://github.com/Hell-space/qinglan-launcher/releases/latest)
+
+首次使用可下载安装版，也可直接运行便携版。从 1.18.0 或更早版本升级时，如果程序目录里已经有游戏资料，可把新版便携程序放到原 `.minecraft` 的上一级目录并打开。
+
+从 1.19.0 起，青岚会在启动后和运行期间自动检查正式版。有更新时点右上角「有新版本」，查看说明并下载，校验完成后点「重启更新」。下次继续使用原来的入口。手动检查位于「设置」底部。
