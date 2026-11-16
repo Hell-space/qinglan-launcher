@@ -1,0 +1,121 @@
+name: Verify public Windows upgrade
+on:
+  push:
+    branches: ['qa/public-upgrade-2.0.1-20261116']
+permissions: {}
+jobs:
+  public-windows-upgrade:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - name: Open 1.20.2, install 2.0.1 from the public channel and cold-start again
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --ignore-scripts --no-audit --no-fund --no-save playwright-core@1.56.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          import assert from 'node:assert/strict'
+          import { createHash, randomUUID } from 'node:crypto'
+          import { spawn } from 'node:child_process'
+          import { existsSync } from 'node:fs'
+          import { join } from 'node:path'
+          import { tmpdir } from 'node:os'
+          import { mkdtemp, mkdir, writeFile, readFile, readdir } from 'node:fs/promises'
+          import { chromium } from 'playwright-core'
+          
+          const old = '1.20.2', latest = '2.0.1'
+          const root = await mkdtemp(join(tmpdir(), 'qinglan-release-'))
+          const profile = join(root, 'profile'), games = join(root, '.minecraft'), id = randomUUID()
+          const marker = join(games, 'instances', id, 'saves', 'retention.txt')
+          const entry = join(root, 'Qinglan-original.exe'), sleep = ms => new Promise(r => setTimeout(r, ms))
+          const sum = bytes => createHash('sha256').update(bytes).digest('hex')
+          const asset = 'https://github.com/Hell-space/qinglan-launcher/releases/download/v1.20.2/Qinglan-Launcher-1.20.2-portable.exe'
+          const original = await fetch(asset, { signal: AbortSignal.timeout(150000) })
+          assert.ok(original.ok, 'Public 1.20.2 download failed')
+          const bytes = Buffer.from(await original.arrayBuffer())
+          assert.equal(sum(bytes), '794ccf2ba65d8f38d87a585030efdad08ac7bd107a2ceccaa2cd30e58ae9a6fe')
+          await writeFile(entry, bytes)
+          await mkdir(profile)
+          await mkdir(join(games, 'instances', id, 'saves'), { recursive:true })
+          await writeFile(marker, 'before upgrade')
+          await writeFile(join(profile,'state.json'),JSON.stringify({
+            settings:{gameRoot:games,playerName:'PublicQA',autoLauncherUpdates:false,notifications:false},
+            instances:[{id,root:games,name:'QA',loader:'vanilla',minecraft:'1.21.1',versionId:'1.21.1',javaMajor:21,createdAt:'2026-01-01T00:00:00Z'}],
+            selectedId:id,jobs:[]
+          }))
+          async function waitFor(fn, label, ms=100000) {
+            const end=Date.now()+ms
+            let last
+            while(Date.now()<end) {
+              try { const value=await fn(); if(value)return value } catch(e) { last=e }
+              await sleep(350)
+            }
+            throw Error(label+' timed out '+(last?.message||''))
+          }
+          function launchOriginal() {
+            const child=spawn(entry,['--user-data-dir='+profile,'--remote-debugging-port=0','--disable-gpu'],{windowsHide:true,stdio:'ignore'})
+            child.unref()
+          }
+          async function connect(expected, oldEndpoint) {
+            return waitFor(async()=>{
+              const [port,path]=(await readFile(join(profile,'DevToolsActivePort'),'utf8')).trim().split(/\r?\n/)
+              if(!/^\d+$/.test(port))return
+              const info=await (await fetch('http://127.0.0.1:'+port+'/json/version',{signal:AbortSignal.timeout(1500)})).json()
+              const endpoint=info.webSocketDebuggerUrl
+              if(!endpoint?.endsWith(path) || endpoint===oldEndpoint)return
+              const browser=await chromium.connectOverCDP(endpoint,{timeout:5000})
+              const page=browser.contexts()[0]?.pages().find(p=>p.url().startsWith('file:'))
+              const version=await page?.evaluate(async()=> (await window.qinglan?.launcherUpdateStatus())?.current).catch(()=>undefined)
+              if(version!==expected){await browser.close();return}
+              await page.locator('.launch-page').waitFor()
+              return {page,browser,endpoint}
+            },'Opening '+expected)
+          }
+          async function closeClient({page,browser}) {
+            const closed=page.waitForEvent('close',{timeout:25000})
+            await page.evaluate(()=>window.qinglan.window('close')).catch(()=>{})
+            await closed
+            await browser.close().catch(()=>{})
+          }
+          async function verifyProfile(page) {
+            const s=await page.evaluate(()=>window.qinglan.snapshot())
+            assert.equal(s.selectedId,id); assert.equal(s.instances.length,1); assert.equal(s.instances[0].root,games)
+            assert.equal(s.settings.playerName,'PublicQA'); assert.equal(s.settings.autoLauncherUpdates,false)
+            assert.equal(await readFile(marker,'utf8'),'before upgrade')
+          }
+          launchOriginal()
+          const first=await connect(old)
+          const page=first.page
+          assert.ok(!existsSync(join(root,'.qinglan-updates')) || !(await readdir(join(root,'.qinglan-updates'),{recursive:true})).some(n=>n.endsWith('.exe')))
+          await page.getByRole('button',{name:'设置',exact:true}).click()
+          await page.getByRole('navigation',{name:'设置分区'}).getByRole('button',{name:'启动器更新'}).click()
+          await page.locator('#settings-updates').getByRole('button',{name:'检查启动器更新'}).click()
+          const dialog=page.getByRole('dialog',{name:'启动器更新'})
+          await dialog.getByRole('heading',{name:'青岚启动器 '+latest,exact:true}).waitFor({timeout:90000})
+          console.log('Verified: public 1.20.2 manually detected signed release 2.0.1. Empty update cache.')
+          await dialog.getByRole('button',{name:'下载更新'}).click()
+          await dialog.getByRole('button',{name:'重启更新',exact:true}).waitFor({timeout:300000})
+          const ready=await page.evaluate(()=>window.qinglan.launcherUpdateStatus())
+          assert.equal(ready.phase,'ready');assert.equal(ready.total,115718069);assert.equal(ready.bytes,ready.total)
+          const cache=join(root,'.qinglan-updates')
+          const files=(await readdir(cache,{recursive:true})).filter(n=>n.endsWith('.exe'))
+          assert.equal(files.length,1)
+          assert.equal(sum(await readFile(join(cache,files[0]))),'c49ff76e0d648e2e83c775bbd7e79f9fbea606435f7b55ae56abdc0b04be1ab2')
+          console.log('Verified: unmodified client downloaded 115718069 bytes; entire on-disk SHA-256 matches release.')
+          await dialog.getByRole('button',{name:'重启更新',exact:true}).click().catch(e=>{if(!/closed|destroyed|target/i.test(String(e)))throw e})
+          const next=await connect(latest,first.endpoint)
+          await verifyProfile(next.page)
+          await waitFor(async()=>(await readdir(join(profile,'launcher-updates'),{recursive:true})).some(p=>p.endsWith('active.json')),'Activation receipt')
+          await closeClient(next); await sleep(1100)
+          launchOriginal()
+          const final=await connect(latest,next.endpoint)
+          await verifyProfile(final.page)
+          await final.page.getByRole('button',{name:'设置',exact:true}).click()
+          await final.page.getByRole('button',{name:'检查启动器更新',exact:true}).click()
+          await final.page.getByText('已是最新正式版',{exact:true}).waitFor({timeout:90000})
+          console.log('Verified: restarted into 2.0.1, preserved selected instance, settings and save marker; original 1.20.2 entry cold-started 2.0.1 and reported current.')
+          await closeClient(final)
+          '@ | Set-Content -LiteralPath verify.mjs -Encoding utf8NoBOM
+          node verify.mjs
+          exit $LASTEXITCODE
